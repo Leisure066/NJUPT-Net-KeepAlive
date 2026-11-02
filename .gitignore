@@ -1,0 +1,18 @@
+# local config with your real account - never commit
+config.ps1
+
+# runtime logs
+keepalive.log
+*.log
+
+# editors / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+
+# build artifacts
+dist/
+build/
+*.zip
