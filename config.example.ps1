@@ -6,5 +6,5 @@ $Config = @{
     WlanIface     = 'WLAN'
     PortalHost    = 'p.njupt.edu.cn'
     PortalIP      = '10.10.244.11'
-    PortalPort    = 804
+    PortalPort    = 802
 }

@@ -4,6 +4,7 @@ $root       = $PSScriptRoot
 $configPath = Join-Path $root 'config.ps1'
 $scriptPath = Join-Path $root 'portal.ps1'
 $taskName   = 'NJUPT-net-KeepAlive'
+$legacyTaskName = 'NJUPT-Portal-KeepAlive'
 
 Write-Host ''
 Write-Host '=== NJUPT net KeepAlive setup ==='
@@ -46,7 +47,7 @@ $lines = @(
     ("    WlanIface     = '{0}'" -f $wlanIface),
     "    PortalHost    = 'p.njupt.edu.cn'",
     "    PortalIP      = '10.10.244.11'",
-    '    PortalPort    = 804',
+    '    PortalPort    = 802',
     '}'
 )
 Set-Content -Path $configPath -Value $lines -Encoding UTF8
@@ -70,6 +71,15 @@ $principal = New-ScheduledTaskPrincipal `
     -UserId "$env:USERDOMAIN\$env:USERNAME" `
     -LogonType Interactive `
     -RunLevel Highest
+
+# Older copies used a second task name. Disable it so two logins cannot
+# compete for the same campus-network account.
+$legacyTask = Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue
+if ($legacyTask) {
+    Stop-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue
+    Disable-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue | Out-Null
+    Write-Host "Disabled legacy task: $legacyTaskName"
+}
 
 Register-ScheduledTask -TaskName $taskName -Action $action `
     -Trigger @($triggerBoot, $triggerLogon) -Settings $settings `

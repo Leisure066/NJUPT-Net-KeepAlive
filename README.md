@@ -16,8 +16,9 @@
 - **有线优先，断线切无线**：有线可用时认证有线；有线断开自动连校园 WiFi
 - **NAT 感知**：自动从 Portal 页面读取服务器认定的客户端 IP，适配宿舍路由器 NAT
 - **断网自愈**：60 秒检测一次，掉线自动重新认证
-- **失败退避**：连续失败 3 次暂停 5 分钟，避免触发 Portal 的失败锁定
-- **日志可查**：所有动作写入 `keepalive.log`，响应内容按 UTF-8 解码，中文不乱码
+- **失败退避**：失败后逐步延长等待时间，最长 5 分钟，避免触发 Portal 的失败锁定
+- **单实例保护**：同一时间只允许一个保活进程运行，避免两个任务互相顶号
+- **日志可查**：记录出口地址、HTTP 状态、`curl` 退出码和 Portal 响应，账号密码会被隐藏
 
 ## 实测范围
 
@@ -57,7 +58,7 @@
   │    ├─ 有线网卡 Up → 直接用有线认证
   │    └─ 有线断开   → netsh 连接校园 WiFi，再认证
   ├─ 认证前先 GET /a79.htm，解析 v46ip（服务器看到的客户端 IP）
-  ├─ 用 curl 发认证请求（PowerShell 的 Invoke-WebRequest 处理不了 TLS 重协商）
+  ├─ 用 curl 向 Portal 802 端口发送认证请求
   └─ 认证后 5 秒再探测一次，失败则退避
 ```
 
@@ -107,6 +108,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\portal.ps1 -Once -DebugMod
 
 注意：`-Once` 在**在线状态**下会直接退出，只有断网/未认证时才会触发认证。
 
+只检查 Portal 地址和客户端 IP，不提交登录：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\portal.ps1 -ProbeOnly
+```
+
+在线状态下强制执行一次登录测试，仅在明确需要调试时使用：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\portal.ps1 -Once -ForceLogin -DebugMode
+```
+
 ### 3. 卸载
 
 右键 `uninstall.bat` → 以管理员身份运行。
@@ -124,9 +137,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\portal.ps1 -Once -DebugMod
 | `WlanIface` | 无线网卡名 | `WLAN` |
 | `PortalHost` | 认证页域名 | `p.njupt.edu.cn` |
 | `PortalIP` | 认证服务器 IP（**关键**） | `10.10.244.11` |
-| `PortalPort` | eportal 端口 | `804` |
+| `PortalPort` | eportal 端口 | `802` |
 
 `PortalIP` 可以通过在线时执行 `Resolve-DnsName p.njupt.edu.cn -Type A` 获取。
+
+从旧版本升级时，除了更新 `portal.ps1`，还要把已有 `config.ps1` 中的
+`PortalPort` 从 `804` 改为 `802`。安装向导生成的配置已经使用新端口。
+
+请只保留一个保活任务。旧任务名 `NJUPT-Portal-KeepAlive` 与新任务
+`NJUPT-net-KeepAlive` 不应同时启用；新版脚本另有单实例锁作为第二层保护。
 
 ## 常见问题
 
@@ -142,12 +161,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\portal.ps1 -Once -DebugMod
 宿舍路由器有电但外网断了时，Windows 可能仍优先走有线。
 可以把有线网卡 metric 调高，或临时禁用有线。
 
+**Q：日志提示 802 端口连接失败**
+先确认电脑仍连接 `NJUPT-CMCC` 等校园网，再运行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\portal.ps1 -ProbeOnly
+```
+
+认证服务器地址或端口可能再次调整，应以浏览器登录包中的请求地址为准。
+
 **Q：会不会违反学校规定**
 自动登录等同于代替你本人操作登录页。请只用于自己的账号，并遵守学校网络管理规定。
 
 **Q：密码安全吗**
 密码只保存在本地 `config.ps1`，已在 `.gitignore` 中排除。
-但 `curl` 命令行运行期间会短暂暴露含密码的 URL，单用户机器一般可接受。
+认证参数通过标准输入交给 `curl`，不会出现在进程命令行中；日志也会隐藏账号和密码。
 
 ## 目录结构
 

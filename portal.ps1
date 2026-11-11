@@ -2,7 +2,9 @@
 param(
     [string]$ConfigPath = (Join-Path $PSScriptRoot 'config.ps1'),
     [switch]$Once,
-    [switch]$DebugMode
+    [switch]$DebugMode,
+    [switch]$ProbeOnly,
+    [switch]$ForceLogin
 )
 
 $ErrorActionPreference = 'Continue'
@@ -73,56 +75,116 @@ function Get-Account {
     return (',0,' + $Config.Username + $Config.AccountSuffix)
 }
 
-function New-RandomText([int]$Length) {
-    $chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
-    -join (1..$Length | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
-}
-
 function Get-PortalHost {
     if ($Config.PortalIP) { return $Config.PortalIP }
     return '10.10.244.11'
 }
 
-function Get-PortalClientIP {
+function Get-PortalPort {
+    if ($Config.PortalPort) { return [int]$Config.PortalPort }
+    return 802
+}
+
+function Get-PortalPage {
     $tmp = Join-Path $env:TEMP ('portal-' + [guid]::NewGuid().ToString('N') + '.html')
+    $err = Join-Path $env:TEMP ('portal-' + [guid]::NewGuid().ToString('N') + '.err')
     try {
-        & curl.exe -k -s -m 10 -o $tmp ("https://{0}/a79.htm" -f (Get-PortalHost)) 2>$null | Out-Null
-        if (Test-Path $tmp) {
+        $httpCode = (& curl.exe -k -sS -m 10 -o $tmp -w '%{http_code}' ("https://{0}/a79.htm" -f (Get-PortalHost)) 2>$err | Out-String).Trim()
+        $curlExit = $LASTEXITCODE
+        if (Test-Path $tmp -PathType Leaf) {
             $html = Get-Content -Path $tmp -Raw -Encoding Default -ErrorAction SilentlyContinue
+            $clientIp = ''
             $m = [regex]::Match($html, "v46ip\s*=\s*'([0-9.]+)'")
-            if ($m.Success) { return $m.Groups[1].Value }
+            if ($m.Success) { $clientIp = $m.Groups[1].Value }
+            return [pscustomobject]@{
+                HttpCode  = $httpCode
+                CurlExit  = $curlExit
+                ClientIP  = $clientIp
+            }
         }
-    } catch { }
-    finally { if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue } }
-    return ''
+        return [pscustomobject]@{ HttpCode = $httpCode; CurlExit = $curlExit; ClientIP = '' }
+    } catch {
+        return [pscustomobject]@{ HttpCode = ''; CurlExit = -1; ClientIP = '' }
+    } finally {
+        if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $err) { Remove-Item $err -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Protect-Secret([string]$Text) {
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+    $safe = $Text
+    if ($Config.Username) { $safe = $safe.Replace($Config.Username, '***') }
+    if ($Config.Password) { $safe = $safe.Replace($Config.Password, '***') }
+    return $safe
+}
+
+function ConvertTo-CurlConfigValue([string]$Value) {
+    if ($null -eq $Value) { return '' }
+    return $Value.Replace('\', '\\').Replace('"', '\"')
 }
 
 function Invoke-PortalLogin {
-    $encodedUser = [uri]::EscapeDataString((Get-Account))
-    $encodedPwd  = [uri]::EscapeDataString($Config.Password)
-    $clientIp    = Get-LocalIP
-    $portalIp    = Get-PortalClientIP
-    if ($portalIp) { $clientIp = $portalIp }
-    $encodedUa   = [uri]::EscapeDataString('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0')
-    $ts = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
-
-    $uri = "https://{0}:804/eportal/portal/login?callback=dr1003&login_method=1&is_base64encode=0&user_account={1}&user_password={2}&wlan_user_ip={3}&wlan_user_ipv6=&wlan_user_mac=000000000000&wlan_vlan_id=0&wlan_ac_ip=&wlan_ac_name=&authex_enable=&jsVersion=4.5&terminal_type=1&lang=zh-cn&user_agent={4}&enable_r3=0&mac_type=0&rcn={5}&operate=portal_login&business_type=1&program_index={6}&page_index={7}&v=6879&lang=zh" -f (Get-PortalHost), $encodedUser, $encodedPwd, $clientIp, $encodedUa, (New-RandomText 8), ((New-RandomText 6) + $ts), ((New-RandomText 6) + $ts)
+    $page       = Get-PortalPage
+    $clientIp   = $page.ClientIP
+    $portalHost = Get-PortalHost
+    $portalPort = Get-PortalPort
+    if (-not $clientIp) { $clientIp = Get-LocalIP }
+    $version = Get-Random -Minimum 1000 -Maximum 10000
+    Write-Log ('portal request: GET https://{0}:{1}/eportal/portal/login page_http={2} page_curl={3}' -f $portalHost, $portalPort, $page.HttpCode, $page.CurlExit)
 
     $tmp = Join-Path $env:TEMP ('login-' + [guid]::NewGuid().ToString('N') + '.json')
+    $err = Join-Path $env:TEMP ('login-' + [guid]::NewGuid().ToString('N') + '.err')
+    $curlOutputPath = $tmp.Replace('\', '/')
     try {
-        & curl.exe -k -s -m 15 -o $tmp $uri 2>$null | Out-Null
+        # Feed the query to curl through stdin so the password never appears in
+        # the process command line.
+        $requestConfig = @(
+            ('url = "https://{0}:{1}/eportal/portal/login"' -f $portalHost, $portalPort),
+            'get',
+            'silent',
+            'show-error',
+            'insecure',
+            'max-time = 15',
+            'write-out = "%{http_code}"',
+            ('output = "{0}"' -f $curlOutputPath),
+            'data-urlencode = "callback=dr1003"',
+            'data-urlencode = "login_method=1"',
+            ('data-urlencode = "user_account={0}"' -f (ConvertTo-CurlConfigValue (Get-Account))),
+            ('data-urlencode = "user_password={0}"' -f (ConvertTo-CurlConfigValue $Config.Password)),
+            ('data-urlencode = "wlan_user_ip={0}"' -f $clientIp),
+            'data-urlencode = "wlan_user_ipv6="',
+            'data-urlencode = "wlan_user_mac=000000000000"',
+            'data-urlencode = "wlan_ac_ip="',
+            'data-urlencode = "wlan_ac_name="',
+            'data-urlencode = "jsVersion=4.1.3"',
+            'data-urlencode = "terminal_type=1"',
+            'data-urlencode = "lang=zh-cn"',
+            ('data-urlencode = "v={0}"' -f $version),
+            'data-urlencode = "lang=zh"'
+        )
+        $httpCode = ($requestConfig | & curl.exe --config - 2>$err | Out-String).Trim()
+        $curlExit = $LASTEXITCODE
         $resp = ''
-        if (Test-Path $tmp) {
+        if (Test-Path $tmp -PathType Leaf) {
             $resp = Get-Content -Path $tmp -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
             if ($null -eq $resp) { $resp = '' }
         }
-        if ($DebugMode) { Write-Log ('portal response: ' + $resp) }
+        $curlError = ''
+        if (Test-Path $err -PathType Leaf) {
+            $curlErrorText = Get-Content -Path $err -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+            if ($null -ne $curlErrorText) { $curlError = $curlErrorText.Trim() }
+        }
+        Write-Log ('portal result: http={0} curl={1}' -f $httpCode, $curlExit)
+        if ($curlError) { Write-Log ('curl error: ' + (Protect-Secret $curlError)) }
+        if ($DebugMode -and $resp) { Write-Log ('portal response: ' + (Protect-Secret $resp)) }
         if ($resp -match '"result"\s*:\s*1') { return $true }
-        if ($resp.Trim().Length -gt 0) { Write-Log ('portal returned: ' + $resp.Trim()) }
+        if ($resp.Trim().Length -gt 0) { Write-Log ('portal returned: ' + (Protect-Secret $resp.Trim())) }
     } catch {
-        Write-Log 'portal login failed'
+        Write-Log ('portal login exception: ' + (Protect-Secret $_.Exception.Message))
     } finally {
         if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $err) { Remove-Item $err -Force -ErrorAction SilentlyContinue }
     }
     return $false
 }
@@ -132,46 +194,69 @@ if (-not (Test-Path $ConfigPath)) {
 }
 . $ConfigPath
 
-Write-Log 'keepalive started'
+if ($ProbeOnly) {
+    $page = Get-PortalPage
+    $port = Get-PortalPort
+    Write-Log ('portal probe: host={0} port={1} page_http={2} page_curl={3} client_ip={4}' -f (Get-PortalHost), $port, $page.HttpCode, $page.CurlExit, $page.ClientIP)
+    Write-Host ('Portal: https://{0}:{1}' -f (Get-PortalHost), $port)
+    Write-Host ('Page HTTP: {0}, curl exit: {1}, client IP: {2}' -f $page.HttpCode, $page.CurlExit, $page.ClientIP)
+    if ($page.HttpCode -eq '200' -and $page.CurlExit -eq 0) { exit 0 }
+    exit 1
+}
 
-while ($true) {
-    try {
-        if (Test-Internet) {
-            if ($Once) { break }
-            Start-Sleep -Seconds 60
-            continue
-        }
+$createdNew = $false
+$mutex = New-Object System.Threading.Mutex($true, 'Local\NJUPT-Net-KeepAlive', [ref]$createdNew)
+if (-not $createdNew) {
+    Write-Log 'another keepalive instance is already running, exiting'
+    exit 0
+}
 
-        $wired = Test-WiredUp
-        Write-Log ('offline detected (wiredUp={0})' -f $wired)
+try {
+    Write-Log 'keepalive started'
+    $nextDelay = 30
 
-        if (-not $wired) {
-            $wifi = Get-WifiState
-            if ($wifi.State -ne 'connected' -or $wifi.SSID -ne $Config.SSID) {
-                Ensure-Wifi | Out-Null
-            }
-        }
-
-        if (-not (Test-Internet)) {
-            $ok = Invoke-PortalLogin
-            Start-Sleep -Seconds 5
-            $online = Test-Internet
-            Write-Log ('portal login attempted, ok={0}, online={1}' -f $ok, $online)
-
-            if (-not $online) {
-                $script:FailCount++
-                if ($script:FailCount -ge 3) {
-                    Write-Log ('{0} consecutive failures, backing off 300s' -f $script:FailCount)
-                    Start-Sleep -Seconds 300
-                }
-            } else {
+    while ($true) {
+        try {
+            if ((Test-Internet) -and -not $ForceLogin) {
                 $script:FailCount = 0
+                if ($Once) { break }
+                Start-Sleep -Seconds 60
+                continue
             }
-        }
-    } catch {
-        Write-Log ('error: ' + $_.Exception.Message)
-    }
 
-    if ($Once) { break }
-    Start-Sleep -Seconds 30
+            $wired = Test-WiredUp
+            Write-Log ('offline detected (wiredUp={0})' -f $wired)
+
+            if (-not $wired) {
+                $wifi = Get-WifiState
+                if ($wifi.State -ne 'connected' -or $wifi.SSID -ne $Config.SSID) {
+                    Ensure-Wifi | Out-Null
+                }
+            }
+
+            if ($ForceLogin -or -not (Test-Internet)) {
+                $ok = Invoke-PortalLogin
+                Start-Sleep -Seconds 5
+                $online = Test-Internet
+                Write-Log ('portal login attempted, ok={0}, online={1}' -f $ok, $online)
+
+                if (-not $online) {
+                    $script:FailCount++
+                    $nextDelay = [Math]::Min(300, 30 * [Math]::Pow(2, [Math]::Min($script:FailCount, 4)))
+                    Write-Log ('login retry in {0}s (consecutive failures: {1})' -f $nextDelay, $script:FailCount)
+                } else {
+                    $script:FailCount = 0
+                    $nextDelay = 30
+                }
+            }
+        } catch {
+            Write-Log ('error: ' + (Protect-Secret $_.Exception.Message))
+        }
+
+        if ($Once) { break }
+        Start-Sleep -Seconds $nextDelay
+    }
+} finally {
+    try { $mutex.ReleaseMutex() } catch { }
+    $mutex.Dispose()
 }
