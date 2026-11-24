@@ -25,10 +25,8 @@ switch ($choice.Trim()) {
 $username = (Read-Host 'Student ID').Trim()
 if ([string]::IsNullOrWhiteSpace($username)) { throw 'Student ID cannot be empty' }
 
-$secure = Read-Host 'Password' -AsSecureString
-$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-$password = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
-[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+$password = Read-Host 'Password'
+if ([string]::IsNullOrWhiteSpace($password)) { throw 'Password cannot be empty' }
 
 $wlanIface = 'WLAN'
 $adapter = Get-NetAdapter -Physical -ErrorAction SilentlyContinue |

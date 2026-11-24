@@ -8,7 +8,10 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+$script:KeepAliveVersion = '1.3.0'
 $script:FailCount = 0
+$script:AuthConfigFailCount = 0
+$script:LastPortalMessage = ''
 $script:LogFile = Join-Path $PSScriptRoot 'keepalive.log'
 
 function Write-Log([string]$Message) {
@@ -71,8 +74,9 @@ function Get-LocalIP {
     return ''
 }
 
-function Get-Account {
-    return (',0,' + $Config.Username + $Config.AccountSuffix)
+function Get-Account([string]$Suffix, [bool]$UsePrefix) {
+    $prefix = if ($UsePrefix) { ',0,' } else { '' }
+    return ($prefix + $Config.Username + $Suffix)
 }
 
 function Get-PortalHost {
@@ -85,29 +89,99 @@ function Get-PortalPort {
     return 802
 }
 
+function New-PortalPageResult {
+    return [pscustomobject]@{
+        HttpCode = ''
+        CurlExit = -1
+        ClientIP = ''
+        JsVersion = '4.5.1'
+        AccountSuffix = $null
+        LoginMethod = 1
+        AccountPrefixEnabled = $true
+        NoFilterAccAndPwd = 0
+        EnableR3 = 0
+        EnableUuid = 0
+        Rcn = ''
+        SettingsLoaded = $false
+    }
+}
+
 function Get-PortalPage {
+    $result = New-PortalPageResult
     $tmp = Join-Path $env:TEMP ('portal-' + [guid]::NewGuid().ToString('N') + '.html')
     $err = Join-Path $env:TEMP ('portal-' + [guid]::NewGuid().ToString('N') + '.err')
+    $jsTmp = Join-Path $env:TEMP ('portal-js-' + [guid]::NewGuid().ToString('N') + '.js')
+    $settingsTmp = Join-Path $env:TEMP ('portal-settings-' + [guid]::NewGuid().ToString('N') + '.json')
     try {
-        $httpCode = (& curl.exe -k -sS -m 10 -o $tmp -w '%{http_code}' ("https://{0}/a79.htm" -f (Get-PortalHost)) 2>$err | Out-String).Trim()
-        $curlExit = $LASTEXITCODE
+        $errPath = $err.Replace('\', '/')
+        $pageUrl = "https://{0}/a79.htm" -f (Get-PortalHost)
+        $result.HttpCode = (& curl.exe -k -sS -m 10 --stderr $errPath -o $tmp -w '%{http_code}' $pageUrl | Out-String).Trim()
+        $result.CurlExit = $LASTEXITCODE
         if (Test-Path $tmp -PathType Leaf) {
             $html = Get-Content -Path $tmp -Raw -Encoding Default -ErrorAction SilentlyContinue
-            $clientIp = ''
+            if ($null -eq $html) { $html = '' }
             $m = [regex]::Match($html, "v46ip\s*=\s*'([0-9.]+)'")
-            if ($m.Success) { $clientIp = $m.Groups[1].Value }
-            return [pscustomobject]@{
-                HttpCode  = $httpCode
-                CurlExit  = $curlExit
-                ClientIP  = $clientIp
+            if ($m.Success) { $result.ClientIP = $m.Groups[1].Value }
+            $fileVersion = ''
+            $m = [regex]::Match($html, 'fileVersion\s*=\s*"([^"]+)"')
+            if ($m.Success) { $fileVersion = $m.Groups[1].Value }
+            $jsUrl = "https://{0}/a59.js" -f (Get-PortalHost)
+            if ($fileVersion) { $jsUrl += '?v=_' + $fileVersion }
+            & curl.exe -k -sS -m 10 --stderr NUL -o $jsTmp $jsUrl | Out-Null
+            if (Test-Path $jsTmp -PathType Leaf) {
+                $js = Get-Content -Path $jsTmp -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+                if ($null -ne $js) {
+                    $m = [regex]::Match($js, "var\s+jsVersion\s*=\s*'([^']+)'")
+                    if ($m.Success) { $result.JsVersion = $m.Groups[1].Value }
+                }
             }
+            if ($result.ClientIP) {
+                $encodedIp = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($result.ClientIP))
+                $settingsUrl = "https://{0}:{1}/eportal/portal/page/loadConfig" -f (Get-PortalHost), (Get-PortalPort)
+                & curl.exe -k -sS -G -m 10 --stderr NUL `
+                    --data-urlencode 'callback=dr1003' `
+                    --data-urlencode 'program_index=1' `
+                    --data-urlencode 'wlan_vlan_id=0' `
+                    --data-urlencode "wlan_user_ip=$encodedIp" `
+                    --data-urlencode 'wlan_user_ipv6=' `
+                    --data-urlencode "wlan_user_ssid=$($Config.SSID)" `
+                    --data-urlencode 'wlan_user_areaid=' `
+                    --data-urlencode 'wlan_ac_ip=' `
+                    --data-urlencode 'wlan_ap_mac=' `
+                    --data-urlencode 'gw_id=' `
+                    --data-urlencode "jsVersion=$($result.JsVersion)" `
+                    -o $settingsTmp $settingsUrl | Out-Null
+                if (Test-Path $settingsTmp -PathType Leaf) {
+                    $settingsText = Get-Content -Path $settingsTmp -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+                    $settingsMatch = if ($null -ne $settingsText) { [regex]::Match($settingsText, '\{.*\}', [Text.RegularExpressions.RegexOptions]::Singleline) } else { $null }
+                    if ($settingsMatch -and $settingsMatch.Success) {
+                        try {
+                            $settings = $settingsMatch.Value | ConvertFrom-Json
+                            if ($settings.code -eq 1 -and $settings.data) {
+                                $result.AccountSuffix = [string]$settings.data.account_suffix
+                                $result.LoginMethod = [int]$settings.data.login_method
+                                $result.AccountPrefixEnabled = ([int]$settings.data.account_prefix -eq 1)
+                                $result.NoFilterAccAndPwd = [int]$settings.data.no_filter_accandpwd
+                                $result.EnableR3 = [int]$settings.data.enable_r3
+                                $result.EnableUuid = [int]$settings.data.enable_uuid
+                                $result.Rcn = [string]$settings.data.rcn
+                                $result.SettingsLoaded = $true
+                            }
+                        } catch { }
+                    }
+                }
+            }
+            return $result
         }
-        return [pscustomobject]@{ HttpCode = $httpCode; CurlExit = $curlExit; ClientIP = '' }
+        return $result
     } catch {
-        return [pscustomobject]@{ HttpCode = ''; CurlExit = -1; ClientIP = '' }
+        $result.CurlExit = -1
+        return $result
     } finally {
         if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
         if (Test-Path $err) { Remove-Item $err -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $jsTmp) { Remove-Item $jsTmp -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $settingsTmp) { Remove-Item $settingsTmp -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -129,16 +203,30 @@ function Invoke-PortalLogin {
     $clientIp   = $page.ClientIP
     $portalHost = Get-PortalHost
     $portalPort = Get-PortalPort
+    $script:LastPortalMessage = ''
     if (-not $clientIp) { $clientIp = Get-LocalIP }
     $version = Get-Random -Minimum 1000 -Maximum 10000
-    Write-Log ('portal request: GET https://{0}:{1}/eportal/portal/login page_http={2} page_curl={3}' -f $portalHost, $portalPort, $page.HttpCode, $page.CurlExit)
+    $uuid = if ($page.EnableUuid -eq 1) { [guid]::NewGuid().ToString() } else { '' }
+    $userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0'
+    $effectiveSuffix = if ($null -eq $page.AccountSuffix) { [string]$Config.AccountSuffix } else { [string]$page.AccountSuffix }
+    $accountValue = Get-Account $effectiveSuffix $page.AccountPrefixEnabled
+    if ($page.NoFilterAccAndPwd -eq 1) {
+        $accountValue = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($accountValue))
+    }
+    $passwordValue = $Config.Password
+    if ($page.NoFilterAccAndPwd -eq 1) {
+        $passwordValue = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($passwordValue))
+    }
+    Write-Log ('portal request: GET https://{0}:{1}/eportal/portal/login page_http={2} page_curl={3} settings_loaded={4} js_version={5} configured_suffix="{6}" server_suffix="{7}" login_method={8}' -f $portalHost, $portalPort, $page.HttpCode, $page.CurlExit, $page.SettingsLoaded, $page.JsVersion, $Config.AccountSuffix, $effectiveSuffix, $page.LoginMethod)
 
     $tmp = Join-Path $env:TEMP ('login-' + [guid]::NewGuid().ToString('N') + '.json')
     $err = Join-Path $env:TEMP ('login-' + [guid]::NewGuid().ToString('N') + '.err')
+    $curlConfig = Join-Path $env:TEMP ('login-' + [guid]::NewGuid().ToString('N') + '.cfg')
     $curlOutputPath = $tmp.Replace('\', '/')
+    $curlErrorPath = $err.Replace('\', '/')
     try {
-        # Feed the query to curl through stdin so the password never appears in
-        # the process command line.
+        # Keep credentials out of the process command line. The temporary config
+        # is written without a BOM for Windows PowerShell 5.1 compatibility.
         $requestConfig = @(
             ('url = "https://{0}:{1}/eportal/portal/login"' -f $portalHost, $portalPort),
             'get',
@@ -146,24 +234,37 @@ function Invoke-PortalLogin {
             'show-error',
             'insecure',
             'max-time = 15',
+            ('user-agent = "{0}"' -f (ConvertTo-CurlConfigValue $userAgent)),
             'write-out = "%{http_code}"',
             ('output = "{0}"' -f $curlOutputPath),
+            ('stderr = "{0}"' -f $curlErrorPath),
             'data-urlencode = "callback=dr1003"',
-            'data-urlencode = "login_method=1"',
-            ('data-urlencode = "user_account={0}"' -f (ConvertTo-CurlConfigValue (Get-Account))),
-            ('data-urlencode = "user_password={0}"' -f (ConvertTo-CurlConfigValue $Config.Password)),
+            ('data-urlencode = "login_method={0}"' -f $page.LoginMethod),
+            ('data-urlencode = "is_base64encode={0}"' -f $page.NoFilterAccAndPwd),
+            ('data-urlencode = "user_account={0}"' -f (ConvertTo-CurlConfigValue $accountValue)),
+            ('data-urlencode = "user_password={0}"' -f (ConvertTo-CurlConfigValue $passwordValue)),
             ('data-urlencode = "wlan_user_ip={0}"' -f $clientIp),
             'data-urlencode = "wlan_user_ipv6="',
             'data-urlencode = "wlan_user_mac=000000000000"',
+            'data-urlencode = "wlan_vlan_id=0"',
             'data-urlencode = "wlan_ac_ip="',
             'data-urlencode = "wlan_ac_name="',
-            'data-urlencode = "jsVersion=4.1.3"',
+            'data-urlencode = "authex_enable="',
+            ('data-urlencode = "jsVersion={0}"' -f $page.JsVersion),
+            ('data-urlencode = "user_agent={0}"' -f (ConvertTo-CurlConfigValue $userAgent)),
             'data-urlencode = "terminal_type=1"',
+            ('data-urlencode = "enable_r3={0}"' -f $page.EnableR3),
+            'data-urlencode = "mac_type=0"',
+            ('data-urlencode = "rcn={0}"' -f (ConvertTo-CurlConfigValue $page.Rcn)),
+            'data-urlencode = "operate=portal_login"',
+            'data-urlencode = "business_type=0"',
+            ('data-urlencode = "uuid={0}"' -f $uuid),
             'data-urlencode = "lang=zh-cn"',
-            ('data-urlencode = "v={0}"' -f $version),
-            'data-urlencode = "lang=zh"'
+            ('data-urlencode = "v={0}"' -f $version)
         )
-        $httpCode = ($requestConfig | & curl.exe --config - 2>$err | Out-String).Trim()
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllLines($curlConfig, [string[]]$requestConfig, $utf8NoBom)
+        $httpCode = (& curl.exe --config $curlConfig | Out-String).Trim()
         $curlExit = $LASTEXITCODE
         $resp = ''
         if (Test-Path $tmp -PathType Leaf) {
@@ -179,12 +280,18 @@ function Invoke-PortalLogin {
         if ($curlError) { Write-Log ('curl error: ' + (Protect-Secret $curlError)) }
         if ($DebugMode -and $resp) { Write-Log ('portal response: ' + (Protect-Secret $resp)) }
         if ($resp -match '"result"\s*:\s*1') { return $true }
-        if ($resp.Trim().Length -gt 0) { Write-Log ('portal returned: ' + (Protect-Secret $resp.Trim())) }
+        if ($resp.Trim().Length -gt 0) {
+            $cleanResponse = Protect-Secret $resp.Trim()
+            $m = [regex]::Match($cleanResponse, '"msg"\s*:\s*"([^"]+)"')
+            if ($m.Success) { $script:LastPortalMessage = $m.Groups[1].Value }
+            Write-Log ('portal returned: ' + $cleanResponse)
+        }
     } catch {
         Write-Log ('portal login exception: ' + (Protect-Secret $_.Exception.Message))
     } finally {
         if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
         if (Test-Path $err) { Remove-Item $err -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $curlConfig) { Remove-Item $curlConfig -Force -ErrorAction SilentlyContinue }
     }
     return $false
 }
@@ -194,12 +301,21 @@ if (-not (Test-Path $ConfigPath)) {
 }
 . $ConfigPath
 
+foreach ($requiredKey in @('Username', 'Password', 'SSID', 'WlanIface')) {
+    if (-not $Config.ContainsKey($requiredKey) -or [string]::IsNullOrWhiteSpace([string]$Config[$requiredKey])) {
+        throw "config.ps1 is missing a required value: $requiredKey"
+    }
+}
+
 if ($ProbeOnly) {
     $page = Get-PortalPage
     $port = Get-PortalPort
-    Write-Log ('portal probe: host={0} port={1} page_http={2} page_curl={3} client_ip={4}' -f (Get-PortalHost), $port, $page.HttpCode, $page.CurlExit, $page.ClientIP)
+    $serverSuffix = if ($null -eq $page.AccountSuffix) { '<unknown>' } else { [string]$page.AccountSuffix }
+    Write-Log ('portal probe: host={0} port={1} page_http={2} page_curl={3} client_ip={4} js_version={5} configured_suffix="{6}" server_suffix="{7}" login_method={8} account_prefix={9}' -f (Get-PortalHost), $port, $page.HttpCode, $page.CurlExit, $page.ClientIP, $page.JsVersion, $Config.AccountSuffix, $serverSuffix, $page.LoginMethod, $page.AccountPrefixEnabled)
     Write-Host ('Portal: https://{0}:{1}' -f (Get-PortalHost), $port)
     Write-Host ('Page HTTP: {0}, curl exit: {1}, client IP: {2}' -f $page.HttpCode, $page.CurlExit, $page.ClientIP)
+    Write-Host ('Portal JavaScript version: {0}' -f $page.JsVersion)
+    Write-Host ('Configured suffix: {0}; server suffix: {1}' -f $Config.AccountSuffix, $serverSuffix)
     if ($page.HttpCode -eq '200' -and $page.CurlExit -eq 0) { exit 0 }
     exit 1
 }
@@ -212,8 +328,9 @@ if (-not $createdNew) {
 }
 
 try {
-    Write-Log 'keepalive started'
+    Write-Log ('keepalive started, version={0}' -f $script:KeepAliveVersion)
     $nextDelay = 30
+    $exitCode = 0
 
     while ($true) {
         try {
@@ -225,7 +342,8 @@ try {
             }
 
             $wired = Test-WiredUp
-            Write-Log ('offline detected (wiredUp={0})' -f $wired)
+            $checkLabel = if ($ForceLogin) { 'forced login check requested' } else { 'offline detected' }
+            Write-Log ('{0} (wiredUp={1})' -f $checkLabel, $wired)
 
             if (-not $wired) {
                 $wifi = Get-WifiState
@@ -242,10 +360,26 @@ try {
 
                 if (-not $online) {
                     $script:FailCount++
+                    if ($script:LastPortalMessage -match '\u8ba4\u8bc1\u51fa\u73b0\u5f02\u5e38|\u5bc6\u7801\u9519\u8bef|\u8d26\u53f7|\u8fd0\u8425\u5546') {
+                        $script:AuthConfigFailCount++
+                        Write-Log ('authentication configuration failure {0}: {1}' -f $script:AuthConfigFailCount, $script:LastPortalMessage)
+                        if ($script:AuthConfigFailCount -ge 3) {
+                            Write-Log 'authentication configuration failed 3 times, stopping to avoid triggering Portal limits'
+                            $exitCode = 3
+                            break
+                        }
+                    } else {
+                        $script:AuthConfigFailCount = 0
+                    }
                     $nextDelay = [Math]::Min(300, 30 * [Math]::Pow(2, [Math]::Min($script:FailCount, 4)))
-                    Write-Log ('login retry in {0}s (consecutive failures: {1})' -f $nextDelay, $script:FailCount)
+                    if ($Once) {
+                        Write-Log 'single login attempt failed'
+                    } else {
+                        Write-Log ('login retry in {0}s (consecutive failures: {1})' -f $nextDelay, $script:FailCount)
+                    }
                 } else {
                     $script:FailCount = 0
+                    $script:AuthConfigFailCount = 0
                     $nextDelay = 30
                 }
             }
@@ -260,3 +394,5 @@ try {
     try { $mutex.ReleaseMutex() } catch { }
     $mutex.Dispose()
 }
+
+if ($exitCode -ne 0) { exit $exitCode }

@@ -1,7 +1,7 @@
 $Config = @{
     Username      = 'your-student-id'
     Password      = 'your-password'
-    AccountSuffix = ''
+    AccountSuffix = '@cmcc'
     SSID          = 'NJUPT-CMCC'
     WlanIface     = 'WLAN'
     PortalHost    = 'p.njupt.edu.cn'

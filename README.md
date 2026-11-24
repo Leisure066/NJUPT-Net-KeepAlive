@@ -1,5 +1,7 @@
 # NJUPT-net-KeepAlive
 
+当前版本：**1.3.0**
+
 南京邮电大学（NJUPT）校园网 **后台保活 + 断网自动重连** 的轻量 PowerShell 方案。
 
 面向的场景：Windows 常开、需要远程控制、每天晚上校园网会断、第二天早上恢复后需要重新认证。
@@ -58,7 +60,7 @@
   │    ├─ 有线网卡 Up → 直接用有线认证
   │    └─ 有线断开   → netsh 连接校园 WiFi，再认证
   ├─ 认证前先 GET /a79.htm，解析 v46ip（服务器看到的客户端 IP）
-  ├─ 用 curl 向 Portal 802 端口发送认证请求
+  ├─ 从当前 Portal 脚本读取 jsVersion，再用 curl 向 802 端口发送完整认证请求
   └─ 认证后 5 秒再探测一次，失败则退避
 ```
 
@@ -79,7 +81,7 @@
 
 1. 选择校园网：`1` = CMCC，`2` = CHINANET，`3` = NJUPT
 2. 输入学号
-3. 输入密码（不显示）
+3. 输入密码
 4. 自动生成 `config.ps1`、注册计划任务、后台启动
 
 看到 `Done. Keepalive is running in background.` 即成功。
@@ -108,6 +110,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\portal.ps1 -Once -DebugMod
 
 注意：`-Once` 在**在线状态**下会直接退出，只有断网/未认证时才会触发认证。
 
+也可以双击 `test-once.bat`。它会先暂停，请你在 Portal 注销后按任意键，
+然后只执行一次认证并显示最近日志。
+
 只检查 Portal 地址和客户端 IP，不提交登录：
 
 ```powershell
@@ -132,7 +137,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\portal.ps1 -Once -ForceLog
 |---|---|---|
 | `Username` | 学号 | `your-student-id` |
 | `Password` | 密码 | `your-password` |
-| `AccountSuffix` | 运营商后缀 | `@cmcc` / `@telecom` / 空 |
+| `AccountSuffix` | Portal 页面显示的运营商后缀 | `@cmcc` |
 | `SSID` | 校园 WiFi 名称 | `NJUPT-CMCC` |
 | `WlanIface` | 无线网卡名 | `WLAN` |
 | `PortalHost` | 认证页域名 | `p.njupt.edu.cn` |
@@ -147,6 +152,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\portal.ps1 -Once -ForceLog
 请只保留一个保活任务。旧任务名 `NJUPT-Portal-KeepAlive` 与新任务
 `NJUPT-net-KeepAlive` 不应同时启用；新版脚本另有单实例锁作为第二层保护。
 
+脚本会从 Portal 的 `page/loadConfig` 接口读取当前账号后缀、登录方式和终端参数。
+服务器信息可用时以服务器配置为准，本地 `AccountSuffix` 作为读取失败时的兜底。
+
 ## 常见问题
 
 **Q：认证返回“认证操作非本机终端”**
@@ -156,6 +164,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\portal.ps1 -Once -ForceLog
 **Q：日志里 `result:0`，msg 是密码错误**
 检查 `config.ps1` 里的学号、密码、`AccountSuffix`。
 可以先用浏览器登录 `https://p.njupt.edu.cn/a79.htm` 验证账号密码。
+
+**Q：日志里出现“认证出现异常”**
+先运行 `-ProbeOnly`，比较本地 `AccountSuffix` 与服务器 `server suffix`。
+脚本会优先使用服务器返回值；如果页面配置无法读取，再检查本地配置。
+同一个配置类认证错误连续出现 3 次后，脚本会停止，避免触发 Portal 限制。
 
 **Q：连上 WiFi 但流量还是走有线**
 宿舍路由器有电但外网断了时，Windows 可能仍优先走有线。
@@ -175,7 +188,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\portal.ps1 -ProbeOnly
 
 **Q：密码安全吗**
 密码只保存在本地 `config.ps1`，已在 `.gitignore` 中排除。
-认证参数通过标准输入交给 `curl`，不会出现在进程命令行中；日志也会隐藏账号和密码。
+认证参数通过无 BOM 的临时配置文件交给 `curl`，不会出现在进程命令行中；
+临时文件在请求结束后删除，日志也会隐藏账号和密码。
 
 ## 目录结构
 
@@ -185,6 +199,7 @@ NJUPT-net-KeepAlive/
 ├── config.example.ps1    # 配置模板
 ├── install.ps1           # 交互式安装 + 注册计划任务
 ├── install.bat           # 管理员一键安装
+├── test-once.bat         # 注销后双击执行一次认证测试
 ├── uninstall.bat         # 卸载计划任务
 ├── README.md
 ├── LICENSE
